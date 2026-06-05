@@ -14,7 +14,7 @@ SAMPLE_CSV = Path(__file__).parent / "data" / "sample_transactions.csv"
 
 CLIENT_LABELS = {
     "U1": "Client U1 — habitudes régulières (~50 €)",
-    "U2": "Client U2 — déplacement suspect FR → JP",
+    "U2": "Client U2 — café en FR (normal), puis JP en 40 min (suspect)",
     "U3": "Client U3 — données incomplètes / montant négatif",
     "U4": "Client U4 — voyage hôtel (FR puis US, 3 jours)",
 }
@@ -26,6 +26,50 @@ def _risk_label(score: float) -> str:
     if score >= 0.4:
         return "Modéré"
     return "Faible"
+
+
+def _prepare_display_df(df: pd.DataFrame, max_reason_len: int = 50) -> pd.DataFrame:
+    """Formate le tableau pour une lecture claire (compatible thème sombre)."""
+    out = df.copy()
+    out["Statut"] = out["Verdict"].map({
+        "Suspecte": "🔴 Suspecte",
+        "Conforme": "🟢 Conforme",
+    })
+    out["Score"] = out["Score"].apply(lambda s: round(float(s), 2))
+    out["Raison (résumé)"] = out["Raison"].apply(
+        lambda r: (r[:max_reason_len] + "…") if isinstance(r, str) and len(r) > max_reason_len else r
+    )
+    return out[
+        ["ID", "Statut", "Client", "Date", "Montant", "Pays", "Commerçant", "Score", "Raison (résumé)"]
+    ]
+
+
+def _render_transactions_table(df: pd.DataFrame) -> None:
+    """Affiche un tableau lisible sans surcouche pandas (évite le contraste illisible)."""
+    if df.empty:
+        st.info("Aucune transaction à afficher.")
+        return
+    display_df = _prepare_display_df(df)
+    st.dataframe(
+        display_df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "ID": st.column_config.TextColumn("ID", width="small"),
+            "Statut": st.column_config.TextColumn("Statut", width="medium"),
+            "Client": st.column_config.TextColumn("Client", width="small"),
+            "Date": st.column_config.TextColumn("Date", width="medium"),
+            "Montant": st.column_config.TextColumn("Montant", width="medium"),
+            "Pays": st.column_config.TextColumn("Pays", width="small"),
+            "Commerçant": st.column_config.TextColumn("Commerçant", width="medium"),
+            "Score": st.column_config.NumberColumn("Score", format="%.2f", width="small"),
+            "Raison (résumé)": st.column_config.TextColumn(
+                "Raison (résumé)",
+                width="large",
+                help="Texte abrégé — voir l'onglet Alertes pour l'explication complète",
+            ),
+        },
+    )
 
 
 def _format_amount(amount, currency: str | None) -> str:
@@ -137,18 +181,18 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
     conformes = len(rows) - len(alerts)
     avg_score = sum(r["Score"] for r in rows) / len(rows) if rows else 0.0
 
-    st.markdown("---")
-    st.markdown("### Résultats de l'analyse")
-    st.caption(
-        f"{len(rows)} transactions analysées · "
-        f"{len(alerts)} alerte(s) · {conformes} transaction(s) conforme(s)"
-    )
+    with st.container(border=True):
+        st.markdown("### 📊 Résultats de l'analyse")
+        st.caption(
+            f"{len(rows)} transactions analysées · "
+            f"{len(alerts)} alerte(s) · {conformes} transaction(s) conforme(s)"
+        )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total", len(rows), help="Nombre de lignes analysées dans le fichier CSV")
-    m2.metric("Alertes", len(alerts), help="Transactions signalées comme suspectes (score ≥ 0,5)")
-    m3.metric("Conformes", conformes, help="Transactions sans anomalie détectée")
-    m4.metric("Risque moyen", f"{avg_score:.2f}", help="Score moyen sur l'ensemble du lot (0 = sûr, 1 = très risqué)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total", len(rows), help="Nombre de lignes analysées dans le fichier CSV")
+        m2.metric("Alertes", len(alerts), help="Transactions signalées comme suspectes (score ≥ 0,5)")
+        m3.metric("Conformes", conformes, help="Transactions sans anomalie détectée")
+        m4.metric("Risque moyen", f"{avg_score:.2f}", help="Score moyen sur l'ensemble du lot (0 = sûr, 1 = très risqué)")
 
     tab_overview, tab_alerts, tab_clients, tab_help = st.tabs([
         "📋 Vue d'ensemble",
@@ -197,22 +241,14 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
 
         st.caption(f"**{len(filtered)}** ligne(s) affichée(s) sur {len(df)}")
 
-        display_cols = ["ID", "Client", "Date", "Montant", "Pays", "Commerçant", "Score", "Verdict", "Raison"]
+        if filtered.empty:
+            st.info("Aucune transaction ne correspond aux filtres sélectionnés.")
+        else:
+            _render_transactions_table(filtered)
 
-        def _style_row(row):
-            bg = "#fdecea" if row["Verdict"] == "Suspecte" else "#eafaf1"
-            return [f"background-color: {bg}"] * len(row)
-
-        st.dataframe(
-            filtered[display_cols].style.apply(_style_row, axis=1),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown(
-            "🟥 **Rouge** = transaction suspecte · "
-            "🟩 **Vert** = transaction conforme · "
-            "Colonne **Raison** = explication en une phrase"
+        st.caption(
+            "🔴 = suspecte · 🟢 = conforme · "
+            "Raison complète disponible dans l'onglet **Alertes**"
         )
 
     with tab_alerts:
@@ -260,9 +296,9 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
             st.info(CLIENT_LABELS[selected_client])
 
         client_df = pd.DataFrame(client_rows)[
-            ["ID", "Date", "Montant", "Pays", "Commerçant", "Score", "Verdict", "Raison"]
+            ["ID", "Client", "Date", "Montant", "Pays", "Commerçant", "Score", "Verdict", "Raison"]
         ]
-        st.dataframe(client_df, use_container_width=True, hide_index=True)
+        _render_transactions_table(client_df)
 
         client_alert_ids = [r["ID"] for r in client_rows if r["is_suspicious"]]
         if client_alert_ids:
@@ -295,26 +331,63 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
 
             Une transaction est **signalée** lorsque son score atteint **0,5** ou plus.
 
-            ### Règles appliquées par le moteur
+            ### Règles appliquées par le moteur (17 facteurs)
 
-            - **Montant invalide** — montant nul, négatif ou absent
-            - **Données manquantes** — pays ou informations essentielles absentes
-            - **Montant inhabituel** — dépense très supérieure à l'historique du client
-            - **Incohérence géographique** — deux pays différents en moins de 6 heures
-            - **Fréquence anormale** — trop de transactions en très peu de temps
-            - **Paiement à distance** — gros montant sans carte physique
+            **Données & montants**
+            - Montant nul, négatif ou absent
+            - Champs essentiels manquants (pays, client, devise…)
+            - Montant très supérieur à l'historique du client (×8)
+            - Écart statistique (z-score) par rapport à l'historique
+            - Montant rond élevé (ex. 5 000 €) atypique pour le client
+
+            **Comportement & localisation**
+            - Deux pays différents en moins de 6 heures
+            - Changement de devise rapide (< 6 h)
+            - Trop de transactions en 1 heure (≥ 5)
+            - Volume total dépensé en 1 heure anormalement élevé
+
+            **Contexte de paiement**
+            - Gros montant sans carte physique présente
+            - Paiement à distance ≥ 1 000 € (même sans historique)
+            - Transaction nocturne (0h–5h) avec montant ≥ 200 €
+            - Heure inhabituelle pour le client + montant notable
+
+            **Commerçant & doublons**
+            - Commerçant à risque (bijouterie, casino, crypto…)
+            - Nom de commerçant suspect (?, unknown, test…)
+            - Transaction dupliquée (même montant + commerçant en < 30 min)
+            - Premier achat chez un commerçant inconnu, montant élevé
 
             ### Exemples dans le fichier fourni
 
             | ID | Client | Ce qu'il illustre |
             |----|--------|-------------------|
             | T-004 | U1 | Montant 4 800 € vs ~50 € habituels |
-            | T-010 / T-011 | U2 | France puis Japon en 40 minutes |
+            | T-010 | U2 | Café en France — transaction conforme |
+            | T-011 | U2 | Japon 40 min après — incohérence géographique |
             | T-020 | U3 | Montant négatif (-30 €) |
             | T-021 | U3 | Pays manquant |
             | T-030 / T-031 | U4 | Voyage hôtel légitime (3 jours entre FR et US) |
             """
         )
+
+
+def _load_transactions_from_sidebar(use_sample: bool, uploaded) -> list[dict]:
+    if use_sample:
+        return load_transactions(str(SAMPLE_CSV))
+    if uploaded is not None:
+        tmp = Path(".streamlit_upload.csv")
+        tmp.write_bytes(uploaded.getvalue())
+        transactions = load_transactions(str(tmp))
+        tmp.unlink(missing_ok=True)
+        return transactions
+    return []
+
+
+def _run_analysis(transactions: list[dict]) -> None:
+    st.session_state.transactions = transactions
+    st.session_state.results = detect_fraud(transactions)
+    st.session_state.analyzed = True
 
 
 def main() -> None:
@@ -328,6 +401,10 @@ def main() -> None:
         st.session_state.results = None
     if "transactions" not in st.session_state:
         st.session_state.transactions = []
+    if "analyzed" not in st.session_state:
+        st.session_state.analyzed = False
+    if "data_source" not in st.session_state:
+        st.session_state.data_source = None
 
     st.title("🛡️ Détection de fraude financière")
     st.markdown(
@@ -338,50 +415,51 @@ def main() -> None:
     with st.sidebar:
         st.header("Guide pas à pas")
 
-        _render_step_header(1, "Charger un fichier CSV", bool(st.session_state.transactions))
+        _render_step_header(1, "Charger un fichier CSV", True)
         use_sample = st.toggle(
             "Utiliser le fichier d'exemple",
             value=True,
             help="10 transactions de démonstration (clients U1 à U4)",
         )
 
-        loaded: list[dict] = []
-        if use_sample:
-            loaded = load_transactions(str(SAMPLE_CSV))
-            st.success(f"✔ {len(loaded)} transactions chargées")
-            st.caption("Fichier : `data/sample_transactions.csv`")
-        else:
+        uploaded = None
+        if not use_sample:
             uploaded = st.file_uploader(
                 "Importer votre CSV",
                 type=["csv"],
                 help="Même format que l'exemple : transaction_id, timestamp, user_id, amount…",
             )
-            if uploaded:
-                tmp = Path(".streamlit_upload.csv")
-                tmp.write_bytes(uploaded.getvalue())
-                loaded = load_transactions(str(tmp))
-                tmp.unlink(missing_ok=True)
-                st.success(f"✔ {len(loaded)} transactions importées")
+
+        loaded = _load_transactions_from_sidebar(use_sample, uploaded)
+        source_label = "sample" if use_sample else (uploaded.name if uploaded else "none")
+        source_key = f"{source_label}_{len(loaded)}"
+
+        if loaded:
+            st.success(f"✔ {len(loaded)} transactions chargées")
+            if use_sample:
+                st.caption("Fichier : `data/sample_transactions.csv`")
+        else:
+            st.info("Importez un CSV ou activez le fichier d'exemple.")
+
+        if source_key != st.session_state.data_source:
+            st.session_state.data_source = source_key
+            st.session_state.transactions = loaded
+            st.session_state.results = None
+            st.session_state.analyzed = False
 
         st.divider()
-        _render_step_header(2, "Lancer l'analyse", st.session_state.results is not None)
+        _render_step_header(2, "Lancer l'analyse", st.session_state.analyzed)
 
-        analyze_disabled = len(loaded) == 0
-        if analyze_disabled:
-            st.info("Chargez d'abord un fichier CSV (étape 1).")
-
-        analyze_clicked = st.button(
+        if st.button(
             "▶ Lancer l'analyse",
             type="primary",
-            disabled=analyze_disabled,
+            disabled=len(loaded) == 0,
             use_container_width=True,
-            help="Exécute detect_fraud() sur l'ensemble des transactions chargées",
-        )
-
-        if analyze_clicked and loaded:
+            key="sidebar_analyze",
+        ):
             try:
-                st.session_state.transactions = loaded
-                st.session_state.results = detect_fraud(loaded)
+                _run_analysis(loaded)
+                st.rerun()
             except NotImplementedError:
                 st.error("La fonction `detect_fraud` n'est pas encore implémentée.")
             except Exception as exc:
@@ -392,41 +470,60 @@ def main() -> None:
             st.success(f"Analyse terminée — {alert_count} alerte(s)")
 
         st.divider()
-        _render_step_header(
-            3,
-            "Explorer les résultats (onglets)",
-            st.session_state.results is not None,
-        )
-        st.caption("Utilisez les onglets dans la zone principale après l'analyse.")
+        _render_step_header(3, "Consulter les résultats", st.session_state.analyzed)
+        st.caption("Les résultats s'affichent dans la zone principale →")
 
         if st.button("↺ Réinitialiser", use_container_width=True):
             st.session_state.results = None
             st.session_state.transactions = []
+            st.session_state.analyzed = False
+            st.session_state.data_source = None
             st.rerun()
 
-    if not st.session_state.transactions and not loaded:
+    if not loaded:
         st.info("👈 **Commencez par l'étape 1** dans la barre latérale : chargez un fichier CSV.")
-        st.markdown(
-            """
-            #### À quoi sert cette application ?
-
-            Cet outil lit des transactions bancaires (format CSV) et signale celles
-            qui semblent suspectes : montant anormal, pays incohérent, données manquantes, etc.
-
-            **Pour démarrer :** activez le fichier d'exemple dans la barre latérale,
-            puis cliquez sur **Lancer l'analyse**.
-            """
-        )
         return
 
+    # Analyse automatique du fichier d'exemple pour afficher les résultats immédiatement
+    if use_sample and loaded and st.session_state.results is None:
+        try:
+            _run_analysis(loaded)
+            st.rerun()
+        except Exception:
+            pass
+
+    action_col, status_col = st.columns([1, 3])
+    with action_col:
+        if st.button(
+            "▶ Lancer l'analyse",
+            type="primary",
+            disabled=len(loaded) == 0,
+            key="main_analyze",
+            use_container_width=True,
+        ):
+            try:
+                _run_analysis(loaded)
+                st.rerun()
+            except NotImplementedError:
+                st.error("La fonction `detect_fraud` n'est pas encore implémentée.")
+            except Exception as exc:
+                st.error(f"Erreur lors de l'analyse : {exc}")
+
+    with status_col:
+        if st.session_state.results is None:
+            st.warning(
+                "**Étape 2 —** Cliquez sur **Lancer l'analyse** pour afficher les résultats ci-dessous."
+            )
+        else:
+            alert_count = sum(1 for r in st.session_state.results if r["is_suspicious"])
+            st.success(
+                f"**Analyse terminée** — {len(st.session_state.results)} transactions · "
+                f"**{alert_count} alerte(s)** · résultats affichés ci-dessous"
+            )
+
     if st.session_state.results is None:
-        st.warning(
-            "Fichier chargé. Cliquez sur **▶ Lancer l'analyse** dans la barre latérale "
-            "pour afficher les résultats."
-        )
-        with st.expander("Aperçu des données chargées (avant analyse)"):
-            preview = loaded if loaded else st.session_state.transactions
-            st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
+        with st.expander("Aperçu des données chargées (avant analyse)", expanded=True):
+            st.dataframe(pd.DataFrame(loaded), width="stretch", hide_index=True)
         return
 
     render_interface(st.session_state.transactions, st.session_state.results)

@@ -16,8 +16,18 @@ MIN_HISTORY_FOR_AMOUNT = 3
 GEO_TIME_LIMIT_HOURS = 6.0
 FREQUENCY_WINDOW_HOURS = 1.0
 FREQUENCY_LIMIT = 5
+DUPLICATE_WINDOW_HOURS = 0.5
+REMOTE_PAYMENT_MIN_AMOUNT = 1000.0
+NIGHT_MIN_AMOUNT = 200.0
 
 CRITICAL_FIELDS = ("transaction_id", "user_id", "amount", "currency", "merchant")
+
+HIGH_RISK_MERCHANT_KEYWORDS = (
+    "bijouterie", "joaillerie", "jewelry", "casino", "crypto", "bitcoin",
+    "western union", "moneygram", "or ", "gold", "pawn", "pret",
+)
+
+SUSPICIOUS_MERCHANT_KEYWORDS = ("?", "unknown", "inconnu", "test", "xxx")
 
 
 def load_transactions(path):
@@ -80,6 +90,27 @@ def _hours_between(ts_a, ts_b):
     return abs((dt_b - dt_a).total_seconds()) / 3600.0
 
 
+def _hour_of(tx):
+    dt = _parse_timestamp(tx.get("timestamp"))
+    return dt.hour if dt else None
+
+
+def _valid_amounts(history):
+    return [
+        h["amount"]
+        for h in history
+        if h.get("amount") is not None and h["amount"] > 0
+    ]
+
+
+def _amount_baseline(history):
+    valid = _valid_amounts(history)
+    if len(valid) < MIN_HISTORY_FOR_AMOUNT:
+        return None
+    baseline = statistics.median(valid)
+    return baseline if baseline > 0 else None
+
+
 def _check_missing_fields(tx, history=None):
     missing = [field for field in CRITICAL_FIELDS if tx.get(field) is None]
     if tx.get("country") is None:
@@ -99,24 +130,33 @@ def _check_invalid_amount(tx, history=None):
 
 def _check_amount_anomaly(tx, history):
     amount = tx.get("amount")
-    if amount is None or amount <= 0:
+    baseline = _amount_baseline(history)
+    if amount is None or amount <= 0 or baseline is None:
         return None
-
-    valid_amounts = [
-        h["amount"]
-        for h in history
-        if h.get("amount") is not None and h["amount"] > 0
-    ]
-    if len(valid_amounts) < MIN_HISTORY_FOR_AMOUNT:
-        return None
-
-    baseline = statistics.median(valid_amounts)
-    if baseline <= 0:
-        return None
-
     if amount > baseline * AMOUNT_FACTOR:
         return (0.9, "Montant très supérieur à l'habitude du client")
+    return None
 
+
+def _check_amount_zscore(tx, history):
+    """Écart statistique par rapport à l'historique (complète le ratio simple)."""
+    amount = tx.get("amount")
+    valid = _valid_amounts(history)
+    if amount is None or amount <= 0 or len(valid) < MIN_HISTORY_FOR_AMOUNT:
+        return None
+
+    mean = statistics.mean(valid)
+    try:
+        stdev = statistics.stdev(valid)
+    except statistics.StatisticsError:
+        return None
+
+    if stdev <= 0:
+        return None
+
+    zscore = (amount - mean) / stdev
+    if zscore >= 4.0:
+        return (0.82, "Montant statistiquement aberrant pour ce client")
     return None
 
 
@@ -149,13 +189,6 @@ def _check_geo_anomaly(tx, history):
     return None
 
 
-def _apply_geo_flag(result):
-    result["fraud_score"] = max(result.get("fraud_score", 0.0), 0.88)
-    result["is_suspicious"] = result["fraud_score"] >= SUSPICIOUS_THRESHOLD
-    if result.get("reason") == "Transaction conforme au profil du client":
-        result["reason"] = GEO_REASON
-
-
 def _check_frequency(tx, history):
     timestamp = tx.get("timestamp")
     if not timestamp:
@@ -176,37 +209,194 @@ def _check_frequency(tx, history):
     return None
 
 
-def _check_card_not_present(tx, history):
+def _check_velocity_amount(tx, history):
+    """Somme des montants du client sur la dernière heure."""
     amount = tx.get("amount")
-    if tx.get("card_present") is not False or amount is None or amount <= 0:
+    timestamp = tx.get("timestamp")
+    if amount is None or amount <= 0 or not timestamp:
         return None
 
-    valid_amounts = [
-        h["amount"]
-        for h in history
-        if h.get("amount") is not None and h["amount"] > 0
-    ]
-    if len(valid_amounts) < MIN_HISTORY_FOR_AMOUNT:
+    baseline = _amount_baseline(history)
+    if baseline is None:
         return None
 
-    baseline = statistics.median(valid_amounts)
-    if baseline > 0 and amount > baseline * AMOUNT_FACTOR:
-        return (0.75, "Gros montant sans carte physique présente")
+    rolling_sum = amount
+    for past in history:
+        past_amount = past.get("amount")
+        past_ts = past.get("timestamp")
+        if past_amount is None or past_amount <= 0 or not past_ts:
+            continue
+        hours = _hours_between(past_ts, timestamp)
+        if hours is not None and hours <= FREQUENCY_WINDOW_HOURS:
+            rolling_sum += past_amount
+
+    if rolling_sum > baseline * AMOUNT_FACTOR * 2:
+        return (0.67, "Volume de dépenses très élevé sur la dernière heure")
 
     return None
+
+
+def _check_card_not_present(tx, history):
+    amount = tx.get("amount")
+    baseline = _amount_baseline(history)
+    if tx.get("card_present") is not False or amount is None or amount <= 0 or baseline is None:
+        return None
+    if amount > baseline * AMOUNT_FACTOR:
+        return (0.75, "Gros montant sans carte physique présente")
+    return None
+
+
+def _check_remote_high_payment(tx, history):
+    """Paiement à distance (CNP) de montant élevé, même sans historique long."""
+    amount = tx.get("amount")
+    if tx.get("card_present") is not False or amount is None:
+        return None
+    if amount >= REMOTE_PAYMENT_MIN_AMOUNT:
+        return (0.76, "Paiement à distance de montant très élevé")
+    return None
+
+
+def _check_night_transaction(tx, history):
+    """Transactions nocturnes (0h-5h) avec montant significatif."""
+    hour = _hour_of(tx)
+    amount = tx.get("amount")
+    if hour is None or amount is None or amount < NIGHT_MIN_AMOUNT:
+        return None
+    if 0 <= hour < 5:
+        return (0.62, "Transaction effectuée en pleine nuit (0h-5h)")
+    return None
+
+
+def _check_high_risk_merchant(tx, history):
+    merchant = (tx.get("merchant") or "").lower()
+    amount = tx.get("amount") or 0
+    if not any(keyword in merchant for keyword in HIGH_RISK_MERCHANT_KEYWORDS):
+        return None
+    if tx.get("card_present") is False or amount >= 500:
+        return (0.78, "Commerçant à risque élevé (bijouterie, casino, transfert…)")
+    return None
+
+
+def _check_suspicious_merchant_name(tx, history):
+    merchant = (tx.get("merchant") or "").lower()
+    if any(keyword in merchant for keyword in SUSPICIOUS_MERCHANT_KEYWORDS):
+        return (0.58, "Nom de commerçant suspect ou incomplet")
+    return None
+
+
+def _check_duplicate_transaction(tx, history):
+    amount = tx.get("amount")
+    merchant = tx.get("merchant")
+    timestamp = tx.get("timestamp")
+    if amount is None or not merchant or not timestamp:
+        return None
+
+    for past in history:
+        if past.get("amount") != amount or past.get("merchant") != merchant:
+            continue
+        hours = _hours_between(past.get("timestamp"), timestamp)
+        if hours is not None and hours <= DUPLICATE_WINDOW_HOURS:
+            return (0.72, "Transaction dupliquée en très peu de temps")
+    return None
+
+
+def _check_currency_change_rapid(tx, history):
+    """Changement de devise rapide, souvent corrélé à une fraude."""
+    currency = tx.get("currency")
+    timestamp = tx.get("timestamp")
+    if not currency or not timestamp:
+        return None
+
+    for past in reversed(history):
+        past_currency = past.get("currency")
+        past_ts = past.get("timestamp")
+        if not past_currency or past_currency == currency:
+            continue
+        hours = _hours_between(past_ts, timestamp)
+        if hours is not None and hours < GEO_TIME_LIMIT_HOURS:
+            return (0.66, "Changement de devise en peu de temps")
+        break
+
+    return None
+
+
+def _check_new_merchant_high_spend(tx, history):
+    """Premier achat chez un commerçant inconnu avec montant élevé."""
+    amount = tx.get("amount")
+    merchant = (tx.get("merchant") or "").lower()
+    baseline = _amount_baseline(history)
+    if not merchant or amount is None or amount <= 0 or baseline is None:
+        return None
+
+    known_merchants = {(h.get("merchant") or "").lower() for h in history}
+    if merchant in known_merchants:
+        return None
+
+    if amount > baseline * 5:
+        return (0.64, "Premier achat chez un commerçant inconnu, montant élevé")
+
+    return None
+
+
+def _check_unusual_hour_for_client(tx, history):
+    """Heure inhabituelle par rapport aux habitudes horaires du client."""
+    hour = _hour_of(tx)
+    if hour is None or len(history) < MIN_HISTORY_FOR_AMOUNT:
+        return None
+
+    past_hours = [_hour_of(h) for h in history]
+    past_hours = [h for h in past_hours if h is not None]
+    if len(past_hours) < MIN_HISTORY_FOR_AMOUNT:
+        return None
+
+    typical_start = min(past_hours)
+    typical_end = max(past_hours)
+    # Marge de 2 h autour de la plage habituelle observée
+    if hour < typical_start - 2 or hour > typical_end + 2:
+        amount = tx.get("amount")
+        baseline = _amount_baseline(history)
+        if amount and baseline and amount > baseline * 2:
+            return (0.63, "Heure inhabituelle pour ce client, montant notable")
+
+    return None
+
+
+def _check_round_amount_spike(tx, history):
+    """Montants ronds élevés (1000, 5000…) vs historique."""
+    amount = tx.get("amount")
+    baseline = _amount_baseline(history)
+    if amount is None or baseline is None:
+        return None
+    if amount >= 1000 and amount % 100 == 0 and amount > baseline * AMOUNT_FACTOR:
+        return (0.61, "Montant rond élevé, atypique pour ce client")
+    return None
+
+
+CHECKERS = (
+    _check_missing_fields,
+    _check_invalid_amount,
+    _check_amount_anomaly,
+    _check_amount_zscore,
+    _check_geo_anomaly,
+    _check_frequency,
+    _check_velocity_amount,
+    _check_card_not_present,
+    _check_remote_high_payment,
+    _check_night_transaction,
+    _check_high_risk_merchant,
+    _check_suspicious_merchant_name,
+    _check_duplicate_transaction,
+    _check_currency_change_rapid,
+    _check_new_merchant_high_spend,
+    _check_unusual_hour_for_client,
+    _check_round_amount_spike,
+)
 
 
 def _analyze(tx, history):
     signals = [
         signal
-        for checker in (
-            _check_missing_fields,
-            _check_invalid_amount,
-            lambda t, h: _check_amount_anomaly(t, h),
-            lambda t, h: _check_geo_anomaly(t, h),
-            lambda t, h: _check_frequency(t, h),
-            lambda t, h: _check_card_not_present(t, h),
-        )
+        for checker in CHECKERS
         if (signal := checker(tx, history)) is not None
     ]
 
@@ -218,7 +408,8 @@ def _analyze(tx, history):
             "reason": "Transaction conforme au profil du client",
         }
 
-    fraud_score = min(1.0, max(score for score, _ in signals))
+    signals.sort(key=lambda s: s[0], reverse=True)
+    fraud_score = min(1.0, signals[0][0])
     is_suspicious = fraud_score >= SUSPICIOUS_THRESHOLD
     reason = signals[0][1] if len(signals) == 1 else " ; ".join(dict.fromkeys(r for _, r in signals))
 
@@ -238,23 +429,11 @@ def detect_fraud(transactions):
     """
     results = []
     history_by_user = {}
-    index_by_id = {}
 
     for tx in transactions:
         user_id = tx.get("user_id")
         history = history_by_user.get(user_id, [])
-        result = _analyze(tx, history)
-        results.append(result)
-
-        conflict = _find_geo_conflict(tx, history)
-        if conflict is not None:
-            past_id = conflict.get("transaction_id")
-            if past_id in index_by_id:
-                _apply_geo_flag(results[index_by_id[past_id]])
-
-        tid = tx.get("transaction_id")
-        if tid is not None:
-            index_by_id[tid] = len(results) - 1
+        results.append(_analyze(tx, history))
 
         if user_id is not None:
             history_by_user.setdefault(user_id, []).append(tx)
