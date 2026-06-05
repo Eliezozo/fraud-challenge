@@ -6,6 +6,7 @@ La fonction `load_transactions` vous est FOURNIE (ne la modifiez pas).
 """
 
 import csv
+import re
 import statistics
 from datetime import datetime, timezone
 
@@ -21,13 +22,17 @@ FREQUENCY_LIMIT = 5
 DUPLICATE_WINDOW_HOURS = 0.5
 REMOTE_PAYMENT_MIN_AMOUNT = 1000.0
 NIGHT_MIN_AMOUNT = 200.0
+UNUSUAL_HOUR_DISTANCE = 3
 
 CRITICAL_FIELDS = ("transaction_id", "user_id", "amount", "currency", "merchant")
 
-HIGH_RISK_MERCHANT_KEYWORDS = (
-    "bijouterie", "joaillerie", "jewelry", "casino", "crypto", "bitcoin",
-    "western union", "moneygram", "or ", "gold", "pawn", "pret",
-)
+# Tokens entiers (comparaison mot à mot, évite les faux positifs type "Major" -> "or")
+HIGH_RISK_MERCHANT_TOKENS = frozenset({
+    "bijouterie", "joaillerie", "jewelry", "casino", "crypto",
+    "bitcoin", "or", "gold", "pawn", "pret", "prets",
+})
+# Expressions multi-mots recherchées telles quelles
+HIGH_RISK_MERCHANT_PHRASES = ("western union", "moneygram")
 
 SUSPICIOUS_MERCHANT_KEYWORDS = ("?", "unknown", "inconnu", "test", "xxx")
 
@@ -167,6 +172,16 @@ def _hour_of(tx):
     return dt.hour if dt else None
 
 
+def _circular_hour_distance(hour_a, hour_b):
+    """Distance horaire en tenant compte du cycle de 24h (0h et 23h sont proches)."""
+    diff = abs(hour_a - hour_b) % 24
+    return min(diff, 24 - diff)
+
+
+def _merchant_tokens(merchant):
+    return set(re.findall(r"[a-zà-ÿ0-9]+", (merchant or "").lower()))
+
+
 def _valid_amounts(history):
     return [
         h["amount"]
@@ -196,7 +211,7 @@ def _check_missing_fields(tx, history=None):
 def _check_invalid_amount(tx, history=None):
     amount = tx.get("amount")
     if amount is None or amount <= 0:
-        return (0.9, "Montant nul ou négatif")
+        return (0.95, "Montant nul ou négatif")
     return None
 
 
@@ -295,7 +310,7 @@ def _check_frequency(tx, history):
             recent += 1
 
     if recent >= FREQUENCY_LIMIT:
-        return (0.65, "Fréquence de transactions anormalement élevée")
+        return (0.60, "Fréquence de transactions anormalement élevée")
 
     return None
 
@@ -322,7 +337,7 @@ def _check_velocity_amount(tx, history):
             rolling_sum += past_amount
 
     if rolling_sum > baseline * AMOUNT_FACTOR * 2:
-        return (0.67, "Volume de dépenses très élevé sur la dernière heure")
+        return (0.55, "Volume de dépenses très élevé sur la dernière heure")
 
     return None
 
@@ -333,7 +348,7 @@ def _check_card_not_present(tx, history):
     if tx.get("card_present") is not False or amount is None or amount <= 0 or baseline is None:
         return None
     if amount > baseline * AMOUNT_FACTOR:
-        return (0.75, "Gros montant sans carte physique présente")
+        return (0.45, "Gros montant sans carte physique présente")
     return None
 
 
@@ -343,35 +358,43 @@ def _check_remote_high_payment(tx, history):
     if tx.get("card_present") is not False or amount is None:
         return None
     if amount >= REMOTE_PAYMENT_MIN_AMOUNT:
-        return (0.76, "Paiement à distance de montant très élevé")
+        return (0.60, "Paiement à distance de montant très élevé")
     return None
 
 
 def _check_night_transaction(tx, history):
-    """Transactions nocturnes (0h-5h) avec montant significatif."""
+    """Transactions nocturnes (0h-5h) avec montant significatif.
+
+    Signal faible : une transaction nocturne seule ne suffit pas à alerter,
+    elle doit être corroborée par un autre signal.
+    """
     hour = _hour_of(tx)
     amount = tx.get("amount")
     if hour is None or amount is None or amount < NIGHT_MIN_AMOUNT:
         return None
     if 0 <= hour < 5:
-        return (0.62, "Transaction effectuée en pleine nuit (0h-5h)")
+        return (0.30, "Transaction effectuée en pleine nuit (0h-5h)")
     return None
 
 
 def _check_high_risk_merchant(tx, history):
     merchant = (tx.get("merchant") or "").lower()
-    amount = tx.get("amount") or 0
-    if not any(keyword in merchant for keyword in HIGH_RISK_MERCHANT_KEYWORDS):
+    tokens = _merchant_tokens(merchant)
+    has_keyword = bool(tokens & HIGH_RISK_MERCHANT_TOKENS) or any(
+        phrase in merchant for phrase in HIGH_RISK_MERCHANT_PHRASES
+    )
+    if not has_keyword:
         return None
+    amount = tx.get("amount") or 0
     if tx.get("card_present") is False or amount >= 500:
-        return (0.78, "Commerçant à risque élevé (bijouterie, casino, transfert…)")
+        return (0.55, "Commerçant à risque élevé (bijouterie, casino, transfert…)")
     return None
 
 
 def _check_suspicious_merchant_name(tx, history):
     merchant = (tx.get("merchant") or "").lower()
     if any(keyword in merchant for keyword in SUSPICIOUS_MERCHANT_KEYWORDS):
-        return (0.58, "Nom de commerçant suspect ou incomplet")
+        return (0.40, "Nom de commerçant suspect ou incomplet")
     return None
 
 
@@ -387,7 +410,7 @@ def _check_duplicate_transaction(tx, history):
             continue
         hours = _hours_between(past.get("timestamp"), timestamp)
         if hours is not None and hours <= DUPLICATE_WINDOW_HOURS:
-            return (0.72, "Transaction dupliquée en très peu de temps")
+            return (0.55, "Transaction dupliquée en très peu de temps")
     return None
 
 
@@ -405,7 +428,7 @@ def _check_currency_change_rapid(tx, history):
             continue
         hours = _hours_between(past_ts, timestamp)
         if hours is not None and hours < GEO_TIME_LIMIT_HOURS:
-            return (0.66, "Changement de devise en peu de temps")
+            return (0.40, "Changement de devise en peu de temps")
 
     return None
 
@@ -423,30 +446,31 @@ def _check_new_merchant_high_spend(tx, history):
         return None
 
     if amount > baseline * 5:
-        return (0.64, "Premier achat chez un commerçant inconnu, montant élevé")
+        return (0.45, "Premier achat chez un commerçant inconnu, montant élevé")
 
     return None
 
 
 def _check_unusual_hour_for_client(tx, history):
-    """Heure inhabituelle par rapport aux habitudes horaires du client."""
+    """Heure inhabituelle par rapport aux habitudes horaires du client.
+
+    Utilise une distance horaire circulaire : 0h et 23h sont considérés proches.
+    """
     hour = _hour_of(tx)
-    if hour is None or len(history) < MIN_HISTORY_FOR_AMOUNT:
+    if hour is None:
         return None
 
-    past_hours = [_hour_of(h) for h in history]
-    past_hours = [h for h in past_hours if h is not None]
+    past_hours = [h for h in (_hour_of(x) for x in history) if h is not None]
     if len(past_hours) < MIN_HISTORY_FOR_AMOUNT:
         return None
 
-    typical_start = min(past_hours)
-    typical_end = max(past_hours)
-    # Marge de 2 h autour de la plage habituelle observée
-    if hour < typical_start - 2 or hour > typical_end + 2:
+    # L'heure est inhabituelle si elle est éloignée de TOUTES les heures connues.
+    min_distance = min(_circular_hour_distance(hour, ph) for ph in past_hours)
+    if min_distance > UNUSUAL_HOUR_DISTANCE:
         amount = tx.get("amount")
         baseline = _amount_baseline(history)
         if amount and baseline and amount > baseline * 2:
-            return (0.63, "Heure inhabituelle pour ce client, montant notable")
+            return (0.30, "Heure inhabituelle pour ce client, montant notable")
 
     return None
 
@@ -458,7 +482,7 @@ def _check_round_amount_spike(tx, history):
     if amount is None or baseline is None:
         return None
     if amount >= 1000 and amount % 100 == 0 and amount > baseline * AMOUNT_FACTOR:
-        return (0.61, "Montant rond élevé, atypique pour ce client")
+        return (0.35, "Montant rond élevé, atypique pour ce client")
     return None
 
 
@@ -500,13 +524,21 @@ def _analyze(tx, history):
         }
 
     signals.sort(key=lambda s: s[0], reverse=True)
-    fraud_score = min(1.0, signals[0][0])
+
+    # Agrégation par "noisy-OR" : plusieurs signaux faibles se renforcent
+    # mutuellement (deux indices faibles peuvent franchir le seuil), tandis
+    # qu'un signal fort isolé suffit toujours à déclencher une alerte.
+    combined = 0.0
+    for score, _ in signals:
+        combined = combined + score - combined * score
+
+    fraud_score = round(min(1.0, combined), 2)
     is_suspicious = fraud_score >= SUSPICIOUS_THRESHOLD
     reason = signals[0][1] if len(signals) == 1 else " ; ".join(dict.fromkeys(r for _, r in signals))
 
     return {
         "transaction_id": tx.get("transaction_id"),
-        "fraud_score": round(fraud_score, 2),
+        "fraud_score": fraud_score,
         "is_suspicious": is_suspicious,
         "reason": reason,
     }

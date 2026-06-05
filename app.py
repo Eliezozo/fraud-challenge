@@ -5,6 +5,7 @@ Interface Streamlit — Hackathon INTELO2026
 from datetime import datetime
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -174,9 +175,194 @@ def _render_transaction_detail(
         st.caption(f"Contexte client : {CLIENT_LABELS[client]}")
 
 
+def _parse_ts_raw(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _build_analytics_df(transactions: list[dict], results: list[dict]) -> pd.DataFrame:
+    """DataFrame enrichi pour les graphiques (timestamps, montants, scores)."""
+    tx_by_id = {t["transaction_id"]: t for t in transactions}
+    records = []
+    for r in results:
+        tx = tx_by_id.get(r["transaction_id"], {})
+        ts = _parse_ts_raw(tx.get("timestamp"))
+        amount = tx.get("amount")
+        records.append({
+            "ID": r["transaction_id"],
+            "Client": tx.get("user_id") or "—",
+            "Timestamp": ts,
+            "Date": ts.strftime("%d/%m/%Y") if ts else "Inconnue",
+            "Montant": float(amount) if amount is not None else None,
+            "Devise": tx.get("currency") or "—",
+            "Pays": tx.get("country") or "— (manquant)",
+            "Commerçant": tx.get("merchant") or "—",
+            "Score": float(r["fraud_score"]),
+            "Niveau": _risk_label(r["fraud_score"]),
+            "Verdict": "Suspecte" if r["is_suspicious"] else "Conforme",
+            "is_suspicious": r["is_suspicious"],
+            "Raison": r["reason"],
+        })
+    return pd.DataFrame(records)
+
+
+def _chart_verdict_pie(df: pd.DataFrame) -> alt.Chart:
+    counts = (
+        df.groupby("Verdict", as_index=False)
+        .size()
+        .rename(columns={"size": "Nombre"})
+    )
+    return (
+        alt.Chart(counts)
+        .mark_arc(innerRadius=55)
+        .encode(
+            theta=alt.Theta("Nombre:Q"),
+            color=alt.Color(
+                "Verdict:N",
+                title="Verdict",
+                scale=alt.Scale(
+                    domain=["Conforme", "Suspecte"],
+                    range=["#1D9E75", "#E74C3C"],
+                ),
+            ),
+            tooltip=["Verdict", "Nombre"],
+        )
+        .properties(title="Répartition conforme / suspecte", height=300)
+    )
+
+
+def _chart_score_timeline(df: pd.DataFrame) -> alt.Chart:
+    timed = df.dropna(subset=["Timestamp"]).copy()
+    if timed.empty:
+        return alt.Chart(pd.DataFrame({"Timestamp": [datetime.now()], "Score": [0]})).mark_line().properties(height=320)
+
+    timed = timed.sort_values("Timestamp")
+    line = (
+        alt.Chart(timed)
+        .mark_line(color="#9FE1CB", strokeWidth=2)
+        .encode(
+            x=alt.X("Timestamp:T", title="Date"),
+            y=alt.Y("Score:Q", title="Score de risque", scale=alt.Scale(domain=[0, 1])),
+            tooltip=["ID", "Timestamp:T", "Score", "Verdict", "Client"],
+        )
+    )
+    points = (
+        alt.Chart(timed[timed["is_suspicious"]])
+        .mark_circle(size=90, color="#E74C3C")
+        .encode(
+            x="Timestamp:T",
+            y="Score:Q",
+            tooltip=["ID", "Timestamp:T", "Score", "Raison"],
+        )
+    )
+    normal_points = (
+        alt.Chart(timed[~timed["is_suspicious"]])
+        .mark_circle(size=50, color="#1D9E75", opacity=0.55)
+        .encode(
+            x="Timestamp:T",
+            y="Score:Q",
+            tooltip=["ID", "Timestamp:T", "Score"],
+        )
+    )
+    return (
+        alt.layer(line, normal_points, points)
+        .properties(title="Courbe des scores de risque dans le temps", height=320)
+    )
+
+
+def _chart_top_reasons(df: pd.DataFrame) -> alt.Chart:
+    alerts = df[df["is_suspicious"]].copy()
+    if alerts.empty:
+        return alt.Chart(pd.DataFrame({"Motif": ["—"], "Nombre": [0]})).mark_bar().properties(height=280)
+
+    alerts["Motif"] = alerts["Raison"].str.split(" ; ").str[0]
+    counts = (
+        alerts.groupby("Motif", as_index=False)
+        .size()
+        .rename(columns={"size": "Nombre"})
+        .sort_values("Nombre", ascending=False)
+        .head(8)
+    )
+    return (
+        alt.Chart(counts)
+        .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, color="#F39C12")
+        .encode(
+            x=alt.X("Nombre:Q", title="Occurrences"),
+            y=alt.Y("Motif:N", sort="-x", title="Motif principal"),
+            tooltip=["Motif", "Nombre"],
+        )
+        .properties(title="Principaux motifs d'alerte", height=280)
+    )
+
+
+def _render_statistics_panel(analytics_df: pd.DataFrame) -> None:
+    scores = analytics_df["Score"]
+    alert_rate = analytics_df["is_suspicious"].mean() * 100 if len(analytics_df) else 0.0
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Score moyen", f"{scores.mean():.2f}", help="0 = sûr · 1 = très risqué")
+    s2.metric("Score le plus élevé", f"{scores.max():.2f}")
+    s3.metric("Taux d'alerte", f"{alert_rate:.1f} %", help="Part de transactions suspectes")
+
+
+def _chart_client_timeline(client_df: pd.DataFrame, client_id: str) -> alt.Chart | None:
+    timed = client_df.dropna(subset=["Timestamp"]).sort_values("Timestamp")
+    if timed.empty:
+        return None
+
+    amount_line = (
+        alt.Chart(timed)
+        .mark_line(point=True, color="#5DADE2", strokeWidth=2)
+        .encode(
+            x=alt.X("Timestamp:T", title="Date"),
+            y=alt.Y("Montant:Q", title="Montant"),
+            color=alt.value("#5DADE2"),
+            tooltip=["ID", "Timestamp:T", "Montant", "Commerçant", "Verdict"],
+        )
+    )
+    score_line = (
+        alt.Chart(timed)
+        .mark_line(point=True, color="#E74C3C", strokeWidth=2)
+        .encode(
+            x=alt.X("Timestamp:T", title="Date"),
+            y=alt.Y("Score:Q", title="Score", scale=alt.Scale(domain=[0, 1])),
+            color=alt.value("#E74C3C"),
+            tooltip=["ID", "Score", "Verdict", "Raison"],
+        )
+    )
+    return (
+        alt.layer(amount_line, score_line)
+        .resolve_scale(y="independent")
+        .properties(title=f"Historique client {client_id} — montants & scores", height=320)
+    )
+
+
+def _render_charts_dashboard(analytics_df: pd.DataFrame) -> None:
+    st.markdown("Quelques graphiques simples pour lire l'analyse en un coup d'œil.")
+
+    _render_statistics_panel(analytics_df)
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Conformes vs suspectes**")
+        st.altair_chart(_chart_verdict_pie(analytics_df), width="stretch")
+    with c2:
+        st.markdown("**Pourquoi les alertes ?**")
+        st.altair_chart(_chart_top_reasons(analytics_df), width="stretch")
+
+    st.markdown("**Évolution du risque dans le temps** (points rouges = alertes)")
+    st.altair_chart(_chart_score_timeline(analytics_df), width="stretch")
+
+
 def render_interface(transactions: list[dict], results: list[dict]) -> None:
     rows = _build_rows(transactions, results)
     df = pd.DataFrame(rows)
+    analytics_df = _build_analytics_df(transactions, results)
     alerts = [r for r in rows if r["is_suspicious"]]
     conformes = len(rows) - len(alerts)
     avg_score = sum(r["Score"] for r in rows) / len(rows) if rows else 0.0
@@ -194,8 +380,9 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
         m3.metric("Conformes", conformes, help="Transactions sans anomalie détectée")
         m4.metric("Risque moyen", f"{avg_score:.2f}", help="Score moyen sur l'ensemble du lot (0 = sûr, 1 = très risqué)")
 
-    tab_overview, tab_alerts, tab_clients, tab_help = st.tabs([
+    tab_overview, tab_charts, tab_alerts, tab_clients, tab_help = st.tabs([
         "📋 Vue d'ensemble",
+        "📈 Graphiques",
         "🚨 Alertes",
         "👤 Par client",
         "❓ Comment lire cette page",
@@ -251,6 +438,9 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
             "Raison complète disponible dans l'onglet **Alertes**"
         )
 
+    with tab_charts:
+        _render_charts_dashboard(analytics_df)
+
     with tab_alerts:
         if not alerts:
             st.success("Aucune alerte détectée dans ce lot de transactions.")
@@ -295,6 +485,34 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
         if selected_client in CLIENT_LABELS:
             st.info(CLIENT_LABELS[selected_client])
 
+        client_analytics = analytics_df[analytics_df["Client"] == selected_client]
+        client_chart = _chart_client_timeline(client_analytics, selected_client)
+        if client_chart is not None:
+            st.altair_chart(client_chart, width="stretch")
+        else:
+            st.caption("Pas assez de dates valides pour afficher la courbe de ce client.")
+
+        if not client_analytics.empty:
+            mini_score = (
+                alt.Chart(client_analytics)
+                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                .encode(
+                    x=alt.X("ID:N", sort=None, title="Transaction"),
+                    y=alt.Y("Score:Q", title="Score", scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color(
+                        "Verdict:N",
+                        scale=alt.Scale(
+                            domain=["Conforme", "Suspecte"],
+                            range=["#1D9E75", "#E74C3C"],
+                        ),
+                        legend=None,
+                    ),
+                    tooltip=["ID", "Score", "Verdict", "Raison"],
+                )
+                .properties(title=f"Score par transaction — {selected_client}", height=260)
+            )
+            st.altair_chart(mini_score, width="stretch")
+
         client_df = pd.DataFrame(client_rows)[
             ["ID", "Client", "Date", "Montant", "Pays", "Commerçant", "Score", "Verdict", "Raison"]
         ]
@@ -319,7 +537,16 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
 
             1. **Barre latérale (gauche)** — Choisissez le fichier CSV (exemple ou import).
             2. **Bouton « Lancer l'analyse »** — Le moteur examine toutes les transactions d'un coup.
-            3. **Onglets (ci-dessus)** — Naviguez entre la vue globale, les alertes et la vue par client.
+            3. **Onglets (ci-dessus)** — Tableau, graphiques, alertes et vue par client.
+
+            ### Onglet Graphiques
+
+            Trois lectures simples, à lire de gauche à droite :
+
+            - **Score moyen / max / taux d'alerte** — la situation en chiffres clés.
+            - **Conformes vs suspectes** — la proportion d'alertes en un camembert.
+            - **Pourquoi les alertes ?** — les principaux motifs qui déclenchent les alertes.
+            - **Évolution du risque dans le temps** — chaque point est une transaction, les rouges sont les alertes.
 
             ### Légende des scores
 
@@ -471,7 +698,7 @@ def main() -> None:
 
         st.divider()
         _render_step_header(3, "Consulter les résultats", st.session_state.analyzed)
-        st.caption("Les résultats s'affichent dans la zone principale →")
+        st.caption("Tableau, graphiques et alertes dans la zone principale →")
 
         if st.button("↺ Réinitialiser", use_container_width=True):
             st.session_state.results = None
