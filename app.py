@@ -184,8 +184,8 @@ def main() -> None:
         except NotImplementedError:
             st.error("Implémentez d'abord `detect_fraud` dans `fraud_detection.py`.")
             return
-        except Exception as exc:
-            st.error(f"Erreur : {exc}")
+        except Exception as e:
+            st.error(f"Erreur : {e}")
             return
 
         render_interface(transactions, results)
