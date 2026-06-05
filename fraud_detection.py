@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 SUSPICIOUS_THRESHOLD = 0.5
 AMOUNT_FACTOR = 8.0
 MIN_HISTORY_FOR_AMOUNT = 3
+EARLY_HISTORY_MAX = 2
+EARLY_AMOUNT_FACTOR = 12.0
 GEO_TIME_LIMIT_HOURS = 6.0
 FREQUENCY_WINDOW_HOURS = 1.0
 FREQUENCY_LIMIT = 5
@@ -90,6 +92,76 @@ def _hours_between(ts_a, ts_b):
     return abs((dt_b - dt_a).total_seconds()) / 3600.0
 
 
+def _build_user_groups(transactions):
+    """Regroupe les transactions par client et mémorise l'ordre du fichier."""
+    index_by_id = {}
+    by_user = {}
+    file_history_by_user = {}
+
+    for index, tx in enumerate(transactions):
+        tid = tx.get("transaction_id")
+        if tid is not None:
+            index_by_id[tid] = index
+
+        user_id = tx.get("user_id")
+        if user_id is None:
+            continue
+
+        by_user.setdefault(user_id, []).append(tx)
+        file_history_by_user.setdefault(user_id, []).append(tx)
+
+    return index_by_id, by_user, file_history_by_user
+
+
+def _chronological_history(tx, user_txs, index_by_id):
+    """Historique client antérieur à la transaction (timestamps désordonnés gérés)."""
+    tid = tx.get("transaction_id")
+    current_ts = _parse_timestamp(tx.get("timestamp"))
+    current_index = index_by_id.get(tid)
+    history = []
+
+    for other in user_txs:
+        other_id = other.get("transaction_id")
+        if other_id == tid:
+            continue
+
+        other_ts = _parse_timestamp(other.get("timestamp"))
+        if current_ts is not None and other_ts is not None:
+            if other_ts < current_ts:
+                history.append(other)
+            elif other_ts == current_ts and current_index is not None:
+                other_index = index_by_id.get(other_id)
+                if other_index is not None and other_index < current_index:
+                    history.append(other)
+        elif current_ts is None and current_index is not None:
+            other_index = index_by_id.get(other_id)
+            if other_index is not None and other_index < current_index:
+                history.append(other)
+
+    return history
+
+
+def _history_for(tx, by_user, file_history_by_user, index_by_id):
+    user_id = tx.get("user_id")
+    if user_id is None:
+        return []
+
+    user_txs = by_user.get(user_id, [])
+    if _parse_timestamp(tx.get("timestamp")) is not None:
+        return _chronological_history(tx, user_txs, index_by_id)
+
+    tid = tx.get("transaction_id")
+    current_index = index_by_id.get(tid)
+    if current_index is None:
+        return []
+
+    return [
+        other
+        for other in file_history_by_user.get(user_id, [])
+        if index_by_id.get(other.get("transaction_id"), current_index) < current_index
+    ]
+
+
 def _hour_of(tx):
     dt = _parse_timestamp(tx.get("timestamp"))
     return dt.hour if dt else None
@@ -138,6 +210,22 @@ def _check_amount_anomaly(tx, history):
     return None
 
 
+def _check_early_amount_spike(tx, history):
+    """Pic de montant alors que le client n'a que peu d'historique."""
+    amount = tx.get("amount")
+    valid = _valid_amounts(history)
+    if amount is None or amount <= 0:
+        return None
+    if len(valid) < 1 or len(valid) > EARLY_HISTORY_MAX:
+        return None
+
+    baseline = statistics.median(valid)
+    if baseline > 0 and amount > baseline * EARLY_AMOUNT_FACTOR:
+        return (0.86, "Montant anormalement élevé pour un historique client limité")
+
+    return None
+
+
 def _check_amount_zscore(tx, history):
     """Écart statistique par rapport à l'historique (complète le ratio simple)."""
     amount = tx.get("amount")
@@ -169,7 +257,9 @@ def _find_geo_conflict(tx, history):
     if not country or not timestamp:
         return None
 
-    for past in reversed(history):
+    closest = None
+    closest_hours = None
+    for past in history:
         past_country = past.get("country")
         past_ts = past.get("timestamp")
         if not past_country or not past_ts or past_country == country:
@@ -177,10 +267,11 @@ def _find_geo_conflict(tx, history):
 
         hours = _hours_between(past_ts, timestamp)
         if hours is not None and hours < GEO_TIME_LIMIT_HOURS:
-            return past
-        break
+            if closest_hours is None or hours < closest_hours:
+                closest = past
+                closest_hours = hours
 
-    return None
+    return closest
 
 
 def _check_geo_anomaly(tx, history):
@@ -307,7 +398,7 @@ def _check_currency_change_rapid(tx, history):
     if not currency or not timestamp:
         return None
 
-    for past in reversed(history):
+    for past in history:
         past_currency = past.get("currency")
         past_ts = past.get("timestamp")
         if not past_currency or past_currency == currency:
@@ -315,7 +406,6 @@ def _check_currency_change_rapid(tx, history):
         hours = _hours_between(past_ts, timestamp)
         if hours is not None and hours < GEO_TIME_LIMIT_HOURS:
             return (0.66, "Changement de devise en peu de temps")
-        break
 
     return None
 
@@ -376,6 +466,7 @@ CHECKERS = (
     _check_missing_fields,
     _check_invalid_amount,
     _check_amount_anomaly,
+    _check_early_amount_spike,
     _check_amount_zscore,
     _check_geo_anomaly,
     _check_frequency,
@@ -427,15 +518,11 @@ def detect_fraud(transactions):
     Retour : list[dict] avec transaction_id, fraud_score (0-1),
     is_suspicious (bool), reason (str) — un résultat par transaction, même ordre.
     """
+    index_by_id, by_user, file_history_by_user = _build_user_groups(transactions)
     results = []
-    history_by_user = {}
 
     for tx in transactions:
-        user_id = tx.get("user_id")
-        history = history_by_user.get(user_id, [])
+        history = _history_for(tx, by_user, file_history_by_user, index_by_id)
         results.append(_analyze(tx, history))
-
-        if user_id is not None:
-            history_by_user.setdefault(user_id, []).append(tx)
 
     return results
