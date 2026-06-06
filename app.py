@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from fraud_detection import detect_fraud, load_transactions
+from pdf_report import build_analysis_pdf
 
 SAMPLE_CSV = Path(__file__).parent / "data" / "sample_transactions.csv"
 
@@ -359,6 +360,57 @@ def _render_charts_dashboard(analytics_df: pd.DataFrame) -> None:
     st.altair_chart(_chart_score_timeline(analytics_df), width="stretch")
 
 
+def _render_pdf_download_button(
+    rows: list[dict],
+    alerts: list[dict],
+    conformes: int,
+    avg_score: float,
+    df: pd.DataFrame,
+) -> None:
+    """Bouton de téléchargement PDF flottant, fixé en bas à droite de la page."""
+    level_counts = df["Niveau"].value_counts().to_dict() if not df.empty else {}
+    summary = {
+        "total": len(rows),
+        "alerts": len(alerts),
+        "conformes": conformes,
+        "avg_score": avg_score,
+        "alert_rate": (len(alerts) / len(rows) * 100) if rows else 0.0,
+        "level_counts": level_counts,
+    }
+
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDownloadButton"] {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            z-index: 1000;
+        }
+        div[data-testid="stDownloadButton"] button {
+            border-radius: 999px;
+            padding: 0.6rem 1.3rem;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        pdf_bytes = build_analysis_pdf(rows, summary)
+        st.download_button(
+            "⬇️ Télécharger le rapport PDF",
+            data=pdf_bytes,
+            file_name=f"rapport_fraude_{datetime.now():%Y%m%d_%H%M}.pdf",
+            mime="application/pdf",
+            type="primary",
+            help="Exporte la synthèse, les alertes et le détail des transactions au format PDF",
+        )
+    except Exception as exc:
+        st.warning(f"Export PDF indisponible : {exc}")
+
+
 def render_interface(transactions: list[dict], results: list[dict]) -> None:
     rows = _build_rows(transactions, results)
     df = pd.DataFrame(rows)
@@ -379,6 +431,8 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
         m2.metric("Alertes", len(alerts), help="Transactions signalées comme suspectes (score ≥ 0,5)")
         m3.metric("Conformes", conformes, help="Transactions sans anomalie détectée")
         m4.metric("Risque moyen", f"{avg_score:.2f}", help="Score moyen sur l'ensemble du lot (0 = sûr, 1 = très risqué)")
+
+    _render_pdf_download_button(rows, alerts, conformes, avg_score, df)
 
     tab_overview, tab_charts, tab_alerts, tab_clients, tab_help = st.tabs([
         "📋 Vue d'ensemble",
@@ -538,6 +592,8 @@ def render_interface(transactions: list[dict], results: list[dict]) -> None:
             1. **Barre latérale (gauche)** — Choisissez le fichier CSV (exemple ou import).
             2. **Bouton « Lancer l'analyse »** — Le moteur examine toutes les transactions d'un coup.
             3. **Onglets (ci-dessus)** — Tableau, graphiques, alertes et vue par client.
+            4. **Bouton « Télécharger le rapport PDF »** — Exporte la synthèse, les alertes
+               et le détail des transactions dans un document partageable.
 
             ### Onglet Graphiques
 
